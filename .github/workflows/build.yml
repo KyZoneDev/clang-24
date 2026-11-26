@@ -62,7 +62,6 @@ jobs:
       run: |
         ccache -M 5G
         cd build
-        ninja -j$(nproc) install-clang-stripped install-lld-stripped install-clang-resource-headers install-llvm-tools-stripped 2>&1 | tail -n 2000 || \
         ninja -j$(nproc) install/strip
         ccache -s
     - name: Package
