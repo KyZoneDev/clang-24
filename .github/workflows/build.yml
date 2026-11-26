@@ -1,0 +1,97 @@
+name: Build Clang
+on:
+  workflow_dispatch:
+    inputs:
+      ref: { description: 'llvm-project ref (branch/tag/sha)', required: false, default: 'main' }
+      release: { description: 'Publish release (true/false)', required: false, default: 'true' }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v5
+    - name: Free disk + swap
+      run: |
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+        df -h /
+    - name: Deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build cmake clang lld ccache python3 libxml2-dev zlib1g-dev libzstd-dev
+    - name: Fetch llvm-project
+      run: |
+        git clone --filter=blob:none --no-checkout https://github.com/llvm/llvm-project.git llvm-project
+        cd llvm-project
+        git fetch origin "${{ github.event.inputs.ref || 'main' }}" --depth=1
+        git checkout FETCH_HEAD
+        echo "LLVM_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+        echo "LLVM_SHORT=$(git rev-parse --short=12 HEAD)" >> $GITHUB_ENV
+        echo "LLVM_DATE=$(date -u +%Y%m%d)" >> $GITHUB_ENV
+        grep -E 'LLVM_VERSION_(MAJOR|MINOR|PATCH) ' cmake/Modules/LLVMVersion.cmake
+    - name: ccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ccache
+        key: ccache-${{ github.run_id }}
+        restore-keys: ccache-
+    - name: Configure
+      run: |
+        mkdir build && cd build
+        cmake -G Ninja ../llvm-project/llvm \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DLLVM_USE_LINKER=lld \
+          -DCMAKE_INSTALL_PREFIX=$PWD/../install \
+          -DLLVM_ENABLE_PROJECTS="clang;lld" \
+          -DLLVM_TARGETS_TO_BUILD="AArch64;ARM;X86" \
+          -DLLVM_ENABLE_ASSERTIONS=OFF \
+          -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_DOCS=OFF \
+          -DCLANG_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_DOCS=OFF \
+          -DLLVM_ENABLE_ZLIB=ON -DLLVM_ENABLE_ZSTD=ON -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_TERMINFO=OFF \
+          -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
+          -DLLVM_PARALLEL_LINK_JOBS=2 \
+          -DLLVM_INSTALL_BINUTILS_SYMLINKS=ON \
+          -DCLANG_DEFAULT_LINKER=lld \
+          -DCLANG_VENDOR="KyZone" \
+          -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
+          -DLLVM_TOOLCHAIN_TOOLS="llvm-ar;llvm-ranlib;llvm-nm;llvm-objcopy;llvm-objdump;llvm-strip;llvm-readelf;llvm-readobj;llvm-size;llvm-strings;llvm-addr2line;llvm-cxxfilt;llvm-symbolizer;llvm-dwarfdump;llvm-as;llvm-dis;llvm-link;llvm-lib;llvm-config"
+    - name: Build
+      run: |
+        ccache -M 5G
+        cd build
+        ninja -j$(nproc) install-clang-stripped install-lld-stripped install-clang-resource-headers install-llvm-tools-stripped 2>&1 | tail -n 2000 || \
+        ninja -j$(nproc) install/strip
+        ccache -s
+    - name: Package
+      run: |
+        cd install
+        ls bin
+        ./bin/clang --version
+        ./bin/ld.lld --version
+        cd ..
+        NAME=clang-24.0.0git-${LLVM_DATE}-${LLVM_SHORT}-x86_64
+        echo "NAME=$NAME" >> $GITHUB_ENV
+        tar -C install -czf $NAME.tar.gz .
+        ls -lh $NAME.tar.gz
+    - name: Smoke test
+      run: |
+        export PATH=$PWD/install/bin:$PATH
+        echo 'int main(){return 0;}' > t.c
+        clang --target=aarch64-linux-gnu -c t.c -o t.o -O2 && llvm-objdump -d t.o | head
+        clang --version | head -1 > clang_version.txt; cat clang_version.txt
+    - name: Release
+      if: ${{ github.event.inputs.release != 'false' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        VER="$(cat clang_version.txt)"
+        gh release create "${NAME}" "${NAME}.tar.gz" \
+          --repo "$GITHUB_REPOSITORY" \
+          --title "Clang 24.0.0git ${LLVM_DATE} (${LLVM_SHORT})" \
+          --notes "${VER}
+
+        Built from llvm/llvm-project@${LLVM_SHA}
+        Projects: clang, lld, LLVM binutils. Targets: AArch64, ARM, X86. Host: Linux x86_64."
